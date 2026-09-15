@@ -1,19 +1,15 @@
 import { NextResponse } from "next/server";
+import { isCjkSource, textLooksCjk } from "@/lib/languages";
+import { runTextTranslate } from "@/lib/vision-translate";
 
 export const maxDuration = 30;
-
-const LANGPAIR = {
-  auto: "Autodetect|th",
-  ja: "ja|th",
-  en: "en|th",
-  zh: "zh-CN|th",
-};
 
 export async function POST(request) {
   try {
     const body = await request.json();
     const texts = Array.isArray(body?.texts) ? body.texts.map((text) => String(text || "")) : [];
     const sourceLanguage = body?.sourceLanguage || "auto";
+    const pageKind = body?.pageKind === "manga" ? "manga" : "";
     if (!texts.length) {
       return NextResponse.json({ translations: [] });
     }
@@ -21,19 +17,28 @@ export async function POST(request) {
       return NextResponse.json({ error: "ข้อความจาก OCR มากเกินไป" }, { status: 400 });
     }
 
-    const langpair = LANGPAIR[sourceLanguage] || LANGPAIR.auto;
-    const translations = [];
-    for (const chunk of chunkTexts(texts, 420)) {
-      const translated = await translateChunk(chunk.joined, langpair);
-      const parts = translated.split("\n");
-      chunk.items.forEach((item, index) => {
-        translations[item.index] = (parts[index] || item.text).trim() || item.text;
+    const cjk = pageKind === "manga" || isCjkSource(sourceLanguage) || textLooksCjk(texts.join(""));
+    if (cjk) {
+      return NextResponse.json({
+        translations: texts,
+        provider: "none",
+        notes: "ยังไม่แปล — มังงะ/ญี่ปุ่น/จีน/เกาหลี ไม่ผ่านบริการแปลคำต่อคำ ใช้ Gemini ทั้งหน้า",
       });
     }
 
-    return NextResponse.json({
-      translations: texts.map((text, index) => translations[index] || text),
-    });
+    try {
+      const translations = await runTextTranslate({ texts, sourceLanguage });
+      return NextResponse.json({ translations, provider: "gemini-lite" });
+    } catch (error) {
+      console.error("translate-text gemini-lite failed", error);
+      const blob = texts.join("\n");
+      const translated = await translateEnglishBlob(blob);
+      const parts = String(translated || "").split("\n");
+      return NextResponse.json({
+        translations: texts.map((text, index) => (parts[index] || "").trim() || text),
+        provider: "mymemory-en",
+      });
+    }
   } catch (error) {
     console.error("translate-text failed", error);
     return NextResponse.json(
@@ -43,34 +48,8 @@ export async function POST(request) {
   }
 }
 
-function chunkTexts(texts, maxChars) {
-  const chunks = [];
-  let current = [];
-  let size = 0;
-
-  texts.forEach((text, index) => {
-    const clipped = text.slice(0, maxChars);
-    if (current.length && size + clipped.length + 1 > maxChars) {
-      chunks.push(formatChunk(current));
-      current = [];
-      size = 0;
-    }
-    current.push({ index, text: clipped });
-    size += clipped.length + 1;
-  });
-  if (current.length) chunks.push(formatChunk(current));
-  return chunks;
-}
-
-function formatChunk(items) {
-  return {
-    items,
-    joined: items.map((item) => item.text).join("\n"),
-  };
-}
-
-async function translateChunk(text, langpair) {
-  const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(langpair)}`;
+async function translateEnglishBlob(text) {
+  const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent("en|th")}`;
   const response = await fetch(url, {
     headers: { Accept: "application/json" },
     signal: AbortSignal.timeout(12000),

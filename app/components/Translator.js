@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useId, useRef, useState } from "react";
-import { SOURCE_LANGUAGES } from "@/lib/languages";
+import { SOURCE_LANGUAGES, isCjkSource, textLooksCjk } from "@/lib/languages";
 import {
   clearHistory,
   deleteHistoryItem,
@@ -29,9 +29,11 @@ import {
   tesseractNeedsLanguageDownload,
 } from "@/lib/tesseract-ocr";
 
-const ENGINE_KEY = "phap-plae-engine";
+const ENGINE_KEY = "phap-plae-engine-v2";
 const SOURCE_ENGINE_KEY = "phap-plae-engine-by-source";
 const ENGINES = ["auto", "tesseract", "gemini"];
+const UNTRANSLATED_NOTE =
+  "โควต้า Gemini เต็มแล้ว — แสดงต้นฉบับ OCR ยังไม่แปล (ไม่ส่งมังงะเข้าบริการแปลคำต่อคำ)";
 
 export default function Translator() {
   const fileInputId = useId();
@@ -44,7 +46,7 @@ export default function Translator() {
   const [fileName, setFileName] = useState("");
   const [imageUrl, setImageUrl] = useState("");
   const [sourceLanguage, setSourceLanguage] = useState("auto");
-  const [engine, setEngine] = useState("tesseract");
+  const [engine, setEngine] = useState("auto");
   const [quota, setQuota] = useState({ used: 0, remaining: GEMINI_RPD });
   const [busyBlock, setBusyBlock] = useState(-1);
   const [busy, setBusy] = useState("");
@@ -220,24 +222,56 @@ export default function Translator() {
     setResult(null);
     setOverlay(null);
     try {
+      const mangaLook = await looksLikeManga(image);
+      const cjk = isCjkSource(sourceLanguage);
+      const mangaPage = mangaLook || cjk;
       let data;
-      if (engine === "gemini") {
-        data = await runGeminiJob(image, { difficulty: "hard" });
-      } else if (engine === "auto" && (await looksLikeManga(image)) && canUseGemini().ok) {
-        setProgress({ percent: 20, label: "ตรวจพบมังงะ — ส่ง Gemini 1 ครั้ง" });
-        data = await runGeminiJob(image, { difficulty: "hard", pageKind: "manga" });
+
+      if (engine === "gemini" || mangaPage) {
+        const gate = canUseGemini();
+        if (gate.ok) {
+          setProgress({
+            percent: 20,
+            label: mangaPage ? "มังงะ/CJK — ส่ง Gemini ทั้งหน้า 1 ครั้ง" : "ส่ง Gemini ทั้งหน้า",
+          });
+          data = await runGeminiJob(image, {
+            difficulty: "hard",
+            pageKind: mangaPage ? "manga" : "",
+          });
+        } else if (engine === "gemini" && !mangaPage) {
+          throw new Error(
+            gate.reason === "rpm"
+              ? "Gemini เกิน 5 ครั้งต่อนาที รอสักครู่"
+              : "Gemini วันนี้ครบ 20 ครั้งแล้ว",
+          );
+        } else {
+          setProgress({ percent: 24, label: "โควต้า Gemini หมด — อ่านต้นฉบับ OCR" });
+          data = await runTesseractJob(image, { translate: false, force: true });
+          data = untranslatedFromOcr(data, UNTRANSLATED_NOTE);
+        }
       } else {
         data = await runTesseractJob(image);
-        if (engine === "auto" && tesseractIsPoor(data)) {
+        const mustGemini =
+          data.kind === "manga" ||
+          data.needsGemini ||
+          isCjkSource(data.detectedLanguageCode) ||
+          textLooksCjk(data.originalText) ||
+          tesseractIsPoor(data);
+        if (mustGemini) {
           const gate = canUseGemini();
           if (gate.ok) {
-            setProgress({ percent: 76, label: "Tesseract อ่านไม่ชัด — ส่ง Gemini 1 ครั้ง" });
-            data = await runGeminiJob(image, { difficulty: "hard" });
-          } else {
-            data = {
-              ...data,
-              notes: `${data.notes || ""} ผล Tesseract อ่านยาก แต่โควต้า Gemini เต็มแล้ว`.trim(),
-            };
+            setProgress({ percent: 76, label: "Tesseract อ่านไม่ชัด — ส่ง Gemini ทั้งหน้า 1 ครั้ง" });
+            data = await runGeminiJob(image, {
+              difficulty: "hard",
+              pageKind:
+                data.kind === "manga" || isCjkSource(data.detectedLanguageCode) ? "manga" : "",
+            });
+          } else if (
+            data.kind === "manga" ||
+            data.needsGemini ||
+            isCjkSource(data.detectedLanguageCode)
+          ) {
+            data = untranslatedFromOcr(data, UNTRANSLATED_NOTE);
           }
         }
       }
@@ -302,11 +336,10 @@ export default function Translator() {
           : "Gemini วันนี้ครบ 20 ครั้งแล้ว",
       );
     }
-    const cacheKey = geminiCacheKey({ image, sourceLanguage, difficulty, region });
+    const kind = pageKind || ((await looksLikeManga(image)) ? "manga" : "");
+    const cacheKey = geminiCacheKey({ image, sourceLanguage, difficulty, region, pageKind: kind });
     const cached = getGeminiCache(cacheKey);
     if (cached) return { ...cached, fromCache: true };
-
-    const kind = pageKind || ((await looksLikeManga(image)) ? "manga" : "");
     const response = await fetch("/api/translate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -325,21 +358,51 @@ export default function Translator() {
     return data;
   }
 
-  async function runTesseractJob(image) {
+  async function runTesseractJob(image, { translate = true, force = false } = {}) {
     const firstLoad = tesseractNeedsLanguageDownload(sourceLanguage);
     setProgress({
       percent: 6,
-      label: firstLoad ? "กำลังโหลดไฟล์ภาษา (ครั้งเดียว)" : "OCR ในเบราว์เซอร์",
+      label: firstLoad ? "กำลังโหลดไฟล์ภาษา (ครั้งเดียว)" : "OCR ในเบราว์เซอร์ — ไม่กินโควต้า",
     });
-    const ocr = await recognizeWithTesseract(image, sourceLanguage, (ratio, status) => {
-      const label =
-        status === "lang" || firstLoad
-          ? "กำลังโหลดไฟล์ภาษา (ครั้งเดียว)"
-          : status === "crop"
-            ? "ครอปเฉพาะข้อความแล้วอ่าน"
-            : "OCR ในเบราว์เซอร์ — ไม่กินโควต้า";
-      setProgress({ percent: 6 + ratio * 64, label });
-    });
+    const ocr = await recognizeWithTesseract(
+      image,
+      sourceLanguage,
+      (ratio, status) => {
+        const label =
+          status === "lang" || firstLoad
+            ? "กำลังโหลดไฟล์ภาษา (ครั้งเดียว)"
+            : status === "crop"
+              ? "ครอปเฉพาะข้อความแล้วอ่าน"
+              : "OCR ในเบราว์เซอร์ — ไม่กินโควต้า";
+        setProgress({ percent: 6 + ratio * 64, label });
+      },
+      { force },
+    );
+    const skipTranslate =
+      !translate ||
+      ocr.kind === "manga" ||
+      ocr.needsGemini ||
+      isCjkSource(sourceLanguage) ||
+      isCjkSource(ocr.detectedLanguageCode) ||
+      textLooksCjk(ocr.originalText);
+    if (skipTranslate) {
+      const blocks = ocr.blocks.map((block) => ({ ...block, translation: "" }));
+      return {
+        kind: ocr.kind,
+        detectedLanguageCode: ocr.detectedLanguageCode,
+        detectedLanguageName: ocr.detectedLanguageName,
+        hasText: Boolean(ocr.hasText || blocks.some((block) => block.original)),
+        originalText: blocks.map((block) => block.original).filter(Boolean).join("\n\n"),
+        translation: "",
+        notes: ocr.notes,
+        blocks,
+        provider: "tesseract",
+        providerLabel: "Tesseract ในเบราว์เซอร์ — ไม่กินโควต้า",
+        targetLanguage: "th",
+        targetLanguageName: "ไทย",
+        needsGemini: Boolean(ocr.needsGemini || ocr.kind === "manga"),
+      };
+    }
     const clearTexts = [];
     const clearIndexes = [];
     ocr.blocks.forEach((block, index) => {
@@ -348,7 +411,7 @@ export default function Translator() {
         clearTexts.push(block.original);
       }
     });
-    setProgress({ percent: 74, label: "แปลไทยผ่านบริการฟรี — ไม่ใช้ Gemini" });
+    setProgress({ percent: 74, label: "แปลป้ายพิมพ์ทั้งก้อน — ไม่กินโควต้า 3.6 Flash" });
     const translations = clearTexts.length
       ? await translateLinesToThai(clearTexts, sourceLanguage)
       : [];
@@ -366,7 +429,7 @@ export default function Translator() {
       detectedLanguageCode: ocr.detectedLanguageCode,
       detectedLanguageName: ocr.detectedLanguageName,
       hasText: Boolean(ocr.hasText || blocks.some((block) => block.original)),
-      originalText: blocks.map((block) => block.original).join("\n\n"),
+      originalText: blocks.map((block) => block.original).filter(Boolean).join("\n\n"),
       translation: blocks
         .filter((block) => block.translation)
         .map((block) => block.translation)
@@ -391,7 +454,7 @@ export default function Translator() {
       const crop = await cropAndBinarize(preview, block);
       const data = await runGeminiJob(crop, {
         region: true,
-        difficulty: block.direction === "vertical" || result.kind === "manga" ? "hard" : "easy",
+        difficulty: "easy",
         pageKind: result.kind === "manga" ? "manga" : "",
       });
       const generated = data.blocks?.[0];
@@ -565,7 +628,7 @@ export default function Translator() {
       <header className="flex flex-col gap-6 sm:flex-row sm:items-end sm:justify-between">
         <div className="max-w-2xl">
           <p className="mb-3 text-[11px] font-medium uppercase tracking-[0.28em] text-gold-dim">
-            JP · EN · CN → ไทย ทับข้อความเดิม
+            JP · KO · EN · CN → ไทย ทับข้อความเดิม
           </p>
           <h1 className="font-display text-4xl leading-none text-paper sm:text-6xl">
             ภาพแปล
@@ -602,7 +665,7 @@ export default function Translator() {
         <div>
           <p className="text-sm text-paper">โหมด OCR</p>
           <p className="mt-1 text-xs leading-5 text-foreground/50">
-            Tesseract สำหรับป้ายพิมพ์ชัด — ไม่กินโควต้า · Gemini สำหรับมังงะ/ฟอนต์ยาก · Auto ลอง Tesseract ก่อน
+            Auto: มังงะ/ญี่ปุ่น/จีน/เกาหลี → Gemini ทั้งหน้า · ป้ายพิมพ์ชัด → Tesseract ไม่กินโควต้า
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -794,9 +857,7 @@ export default function Translator() {
             <p className="mt-3 text-xs text-foreground/50">
               {engine === "tesseract"
                 ? "โหมด Tesseract — ไม่กินโควต้า Gemini"
-                : `Gemini วันนี้ ${quota.used}/${GEMINI_RPD}${
-                    engine === "auto" ? " · Auto ยิงเฉพาะเมื่อ Tesseract อ่านแย่" : ""
-                  }`}
+                : `โหมด ${engine === "auto" ? "Auto" : "Gemini"} · เหลือ ${quota.remaining} จาก ${GEMINI_RPD} ครั้งวันนี้`}
             </p>
             {busy || progress.percent > 0 ? (
               <div className="mt-4">
@@ -832,9 +893,9 @@ export default function Translator() {
                   พรีวิวรูปทับไทยจะโผล่ทางซ้าย
                 </p>
                 <ul className="space-y-1 text-sm text-ink/55">
-                  <li>1. ค่าเริ่มต้นใช้ Tesseract ไม่กินโควต้า</li>
-                  <li>2. อัปโหลดรูป แล้วเลือกภาษาต้นทาง</li>
-                  <li>3. มังงะ/ตัว stylized ค่อยสลับ Gemini หรือกดใช้ Gemini ช่องนั้น</li>
+                  <li>1. มังงะและภาษา ja/ko/zh ใช้ Gemini ทั้งหน้าโดยอัตโนมัติ</li>
+                  <li>2. ป้ายพิมพ์ชัดใช้ Tesseract — ไม่กินโควต้า</li>
+                  <li>3. แก้รายช่องใช้ Flash-Lite ถ้ายังมีโควต้า</li>
                 </ul>
               </div>
             ) : null}
@@ -860,7 +921,7 @@ export default function Translator() {
                     />
                     <TextBlock
                       title="คำแปลไทย"
-                      text={result.translation}
+                      text={result.translation || "ยังไม่แปล"}
                       copied={copied === "translation"}
                       onCopy={() => copyText("translation", result.translation)}
                       featured
@@ -874,9 +935,12 @@ export default function Translator() {
                           {result.blocks.map((block, index) => (
                             <div key={`${block.x}-${block.y}-${index}`} className="block">
                               <span className="mb-1 block text-xs text-ink/45">
-                                {block.original || `บล็อก ${index + 1}`}
+                                บล็อก {index + 1}
                                 {block.unclear ? " · อ่านไม่ชัด" : ""}
                               </span>
+                              <p className="mb-2 whitespace-pre-wrap rounded-xl border border-ink/10 bg-white/50 px-3 py-2 text-sm text-ink/75">
+                                {block.original || "(ไม่มีต้นฉบับ)"}
+                              </p>
                               {block.unclear ? (
                                 <p className="mb-2 rounded-xl border border-ink/15 bg-white/60 px-3 py-2 text-sm text-ink/70">
                                   อ่านไม่ชัด — ไม่ได้ส่งไปแปล
@@ -885,6 +949,7 @@ export default function Translator() {
                                 <textarea
                                   value={block.translation}
                                   onChange={(event) => updateBlock(index, event.target.value)}
+                                  placeholder="ยังไม่แปล"
                                   rows={2}
                                   className="w-full resize-y rounded-xl border border-ink/15 bg-white/70 px-3 py-2 text-sm leading-6 outline-none focus:border-ink/40"
                                 />
@@ -892,12 +957,12 @@ export default function Translator() {
                               <button
                                 type="button"
                                 onClick={() => geminiForBlock(index)}
-                                disabled={Boolean(busy)}
+                                disabled={Boolean(busy) || !canUseGemini().ok}
                                 className="mt-2 text-xs text-gold hover:underline disabled:opacity-40"
                               >
                                 {busyBlock === index
-                                  ? "กำลังส่ง Gemini ช่องนี้…"
-                                  : `ใช้ Gemini ช่องนี้ · วันนี้ ${quota.used}/${GEMINI_RPD}`}
+                                  ? "กำลังส่ง Flash-Lite ช่องนี้…"
+                                  : `ใช้ Flash-Lite ช่องนี้ · เหลือ ${quota.remaining}/${GEMINI_RPD}`}
                               </button>
                             </div>
                           ))}
@@ -1104,9 +1169,27 @@ function paintableBlocks(blocks) {
 
 function tesseractIsPoor(data) {
   const blocks = data?.blocks || [];
+  if (data?.needsGemini || data?.kind === "manga") return true;
   if (!data?.hasText || !blocks.length) return true;
   const unclear = blocks.filter((block) => block.unclear).length;
-  return unclear >= Math.max(1, blocks.length * 0.55);
+  if (unclear >= Math.max(1, blocks.length * 0.55)) return true;
+  const short = blocks.filter(
+    (block) => String(block.original || "").replace(/\s+/g, "").length < 3,
+  ).length;
+  return short >= Math.max(2, Math.ceil(blocks.length * 0.45));
+}
+
+function untranslatedFromOcr(data, notes) {
+  const blocks = (data?.blocks || []).map((block) => ({ ...block, translation: "" }));
+  return {
+    ...data,
+    blocks,
+    translation: "",
+    originalText: blocks.map((block) => block.original).filter(Boolean).join("\n\n"),
+    hasText: blocks.some((block) => block.original),
+    notes: [data?.notes, notes].filter(Boolean).join(" "),
+    needsGemini: true,
+  };
 }
 
 function withBlockTexts(result, blocks) {
@@ -1130,7 +1213,7 @@ function readSourceEngines() {
 }
 
 function engineLabel(value) {
-  if (value === "auto") return "Auto · ลอง Tesseract ก่อน";
+  if (value === "auto") return "Auto · มังงะไป Gemini ก่อน";
   if (value === "gemini") return "Gemini (กินโควต้า)";
   return "Tesseract ในเบราว์เซอร์ — ไม่กินโควต้า";
 }
