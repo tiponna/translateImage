@@ -1,0 +1,42 @@
+@import "tailwindcss";
+
+:root {
+  --background: #100e0b;
+  --foreground: #f4ead8;
+  --paper: #efe4cf;
+  --ink: #1c1710;
+  --gold: #e0b13a;
+  --gold-dim: #a07c22;
+  --line: rgba(224, 177, 58, 0.22);
+  --panel: #1a1712;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-paper: var(--paper);
+  --color-ink: var(--ink);
+  --color-gold: var(--gold);
+  --color-gold-dim: var(--gold-dim);
+  --color-line: var(--line);
+  --color-panel: var(--panel);
+  --font-sans: var(--font-sarabun);
+  --font-display: var(--font-display);
+}
+
+body {
+  background:
+    radial-gradient(1200px 600px at 10% -10%, rgba(224, 177, 58, 0.08), transparent 50%),
+    var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sarabun), "Sarabun", sans-serif;
+}
+
+.font-display {
+  font-family: var(--font-display), "Newsreader", serif;
+}
+
+::selection {
+  background: var(--gold);
+  color: var(--ink);
+}

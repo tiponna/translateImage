@@ -1,27 +1,41 @@
-# Image Translator
+# ภาพแปล
 
-แปลข้อความจากรูปภาพ (OCR + Translate) — ไม่ใช้ Database
+เว็บ Next.js (JavaScript) สำหรับตรวจจับข้อความบน **ป้ายโฆษณา** และ **มังงะ** แล้ววางคำแปล **ภาษาไทยทับตัวอักษรเดิม**
 
-## Stack
+เน้นต้นทาง **ญี่ปุ่น / อังกฤษ / จีน** อัปโหลดรูป หรือวาง URL รูปภาพได้ มีพรีวิวต้นฉบับกับรูปที่แก้แล้ว
 
-- Frontend: Next.js + React + Tailwind CSS
-- API: Next.js API Routes (`/api/ocr`, `/api/translate`)
-- OCR: Tesseract.js
-- Translate: OpenAI (ถ้ามี `OPENAI_API_KEY`) หรือ MyMemory ฟรี
+ค่าเริ่มต้นเป็น **Tesseract ในเบราว์เซอร์** (ไม่กินโควต้า Gemini) สำหรับป้ายพิมพ์ชัด เมนู เอกสาร
 
-## เริ่มใช้งาน
+ใช้ **Gemini** กับมังงะ ฟองพูด ฟอนต์ stylized หรือกด **ใช้ Gemini ช่องนี้** ทีละกรอบ — ประมาณ 20 ครั้ง/วัน
+
+โหมด **Auto** ลอง Tesseract ก่อน ถ้าผลแย่จึงยิง Gemini หนึ่งครั้ง
+
+## เริ่มต้น
 
 ```bash
 npm install
-cp .env.example .env.local   # ใส่ OPENAI_API_KEY ถ้าต้องการ
+copy .env.example .env.local
+```
+
+สร้างคีย์ฟรีที่ [Google AI Studio](https://aistudio.google.com/apikey) แล้วใส่ใน `.env.local`:
+
+```
+GEMINI_API_KEY=your_gemini_key
+```
+
+```bash
 npm run dev
 ```
 
-เปิด http://localhost:3000
+เปิด [http://localhost:3000](http://localhost:3000)
 
-## Flow
+โควต้าฟรีของ Gemini มีจำกัดต่อวัน และ Google อาจนำไปใช้ปรับปรุงโมเดล อย่าส่งรูปที่เป็นความลับ
 
-1. อัปโหลดรูป หรือนำเข้าจาก URL
-2. Preview ด้วย `URL.createObjectURL()` / URL โดยตรง
-3. กด **เริ่มแปลภาษา** → `/api/ocr` → `/api/translate`
-4. แสดง Original + Translated — คัดลอก / ดาวน์โหลดได้
+## วิธีใช้
+
+1. อัปโหลดรูป วางจากคลิปบอร์ด หรือวาง URL แล้วกดโหลด
+2. เลือกต้นทาง JP / EN / CN หรือให้ตรวจจับอัตโนมัติ
+3. กด **ตรวจจับแล้วแปล**
+4. สลับดู **ต้นฉบับ / ทับไทย** แก้คำแปลในแต่ละบล็อกได้ แล้วดาวน์โหลดรูป
+
+คีย์ API อยู่ฝั่งเซิร์ฟเวอร์เท่านั้น
