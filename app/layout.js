@@ -1,11 +1,5 @@
-import { Newsreader, Sarabun } from "next/font/google";
+import { Newsreader } from "next/font/google";
 import "./globals.css";
-
-const sarabun = Sarabun({
-  variable: "--font-sarabun",
-  subsets: ["thai", "latin"],
-  weight: ["400", "500", "600", "700"],
-});
 
 const newsreader = Newsreader({
   variable: "--font-display",
@@ -21,11 +15,20 @@ export const metadata = {
 
 export default function RootLayout({ children }) {
   return (
-    <html
-      lang="th"
-      className={`${sarabun.variable} ${newsreader.variable} h-full antialiased`}
-    >
-      <body className="min-h-full flex flex-col bg-background text-foreground">
+    <html lang="th" className={`${newsreader.variable} h-full antialiased`}>
+      <head>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link
+          rel="preconnect"
+          href="https://fonts.gstatic.com"
+          crossOrigin="anonymous"
+        />
+        <link
+          href="https://fonts.googleapis.com/css2?family=Playpen+Sans+Thai:wght@100..800&display=swap"
+          rel="stylesheet"
+        />
+      </head>
+      <body className="min-h-full flex flex-col bg-background text-foreground font-sans">
         {children}
       </body>
     </html>

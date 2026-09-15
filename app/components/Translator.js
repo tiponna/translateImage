@@ -678,7 +678,7 @@ export default function Translator() {
               key={item.id}
               type="button"
               onClick={() => chooseEngine(item.id)}
-              className={`rounded-full border px-3 py-1.5 text-xs ${
+              className={`rounded-full border px-3 py-1.5 text-xs cursor-pointer ${
                 engine === item.id ? "border-gold bg-gold text-ink" : "border-line text-paper"
               }`}
             >
@@ -958,7 +958,7 @@ export default function Translator() {
                                 type="button"
                                 onClick={() => geminiForBlock(index)}
                                 disabled={Boolean(busy) || !canUseGemini().ok}
-                                className="mt-2 text-xs text-gold hover:underline disabled:opacity-40"
+                                className="mt-2 text-xs text-gold hover:underline disabled:opacity-40 cursor-pointer"
                               >
                                 {busyBlock === index
                                   ? "กำลังส่ง Flash-Lite ช่องนี้…"
@@ -1005,7 +1005,7 @@ export default function Translator() {
       <section className="rounded-[28px] border border-line bg-panel p-5">
         <div className="mb-4 flex items-end justify-between gap-3">
           <div>
-            <h2 className="text-xs uppercase tracking-[0.2em] text-foreground/45">ประวัติในเครื่องนี้</h2>
+            <h2 className="text-xl uppercase tracking-[0.2em] text-foreground/80 font-bold">ประวัติในเครื่องนี้</h2>
             <p className="mt-1 text-sm text-foreground/55">
               ไฟล์ที่แปลแล้วเก็บใน localStorage ของเบราว์เซอร์นี้
             </p>
@@ -1014,7 +1014,7 @@ export default function Translator() {
             <button
               type="button"
               onClick={removeAllHistory}
-              className="text-xs text-foreground/45 hover:text-paper"
+              className="text-xs text-foreground/45 hover:text-paper cursor-pointer"
             >
               ล้างทั้งหมด
             </button>
@@ -1052,14 +1052,14 @@ export default function Translator() {
                   <button
                     type="button"
                     onClick={() => restoreHistory(item)}
-                    className="text-xs text-gold hover:underline"
+                    className="text-xs text-gold hover:underline cursor-pointer"
                   >
                     เปิดในตัวแปล
                   </button>
                   <button
                     type="button"
                     onClick={() => removeHistory(item.id)}
-                    className="text-xs text-foreground/40 hover:text-paper"
+                    className="text-xs text-foreground/40 hover:text-paper cursor-pointer"
                   >
                     ลบ
                   </button>

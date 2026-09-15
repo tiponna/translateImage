@@ -20,8 +20,8 @@
   --color-gold-dim: var(--gold-dim);
   --color-line: var(--line);
   --color-panel: var(--panel);
-  --font-sans: var(--font-sarabun);
-  --font-display: var(--font-display);
+  --font-sans: "Playpen Sans Thai", sans-serif;
+  --font-display: "Playpen Sans Thai", sans-serif;
 }
 
 body {
@@ -29,14 +29,19 @@ body {
     radial-gradient(1200px 600px at 10% -10%, rgba(224, 177, 58, 0.08), transparent 50%),
     var(--background);
   color: var(--foreground);
-  font-family: var(--font-sarabun), "Sarabun", sans-serif;
+  font-family: "Playpen Sans Thai", sans-serif;
 }
 
 .font-display {
-  font-family: var(--font-display), "Newsreader", serif;
+  font-family: "Playpen Sans Thai", sans-serif;
+  font-style: normal;
 }
 
 ::selection {
   background: var(--gold);
   color: var(--ink);
+}
+
+button, a{
+  cursor: pointer;
 }
