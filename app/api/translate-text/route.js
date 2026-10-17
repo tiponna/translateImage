@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 import { isCjkSource, textLooksCjk } from "@/lib/languages";
-import { runTextTranslate } from "@/lib/vision-translate";
 
 export const maxDuration = 30;
 
@@ -11,38 +10,46 @@ export async function POST(request) {
     const sourceLanguage = body?.sourceLanguage || "auto";
     const pageKind = body?.pageKind === "manga" ? "manga" : "";
     if (!texts.length) {
-      return NextResponse.json({ translations: [] });
+      return NextResponse.json({ translations: [], provider: "none", notes: "" });
     }
     if (texts.length > 80) {
       return NextResponse.json({ error: "ข้อความจาก OCR มากเกินไป" }, { status: 400 });
     }
 
-    const cjk = pageKind === "manga" || isCjkSource(sourceLanguage) || textLooksCjk(texts.join(""));
-    if (cjk) {
+    if (pageKind === "manga" || isCjkSource(sourceLanguage) || textLooksCjk(texts.join(""))) {
       return NextResponse.json({
-        translations: texts,
+        translations: texts.map(() => ""),
         provider: "none",
-        notes: "ยังไม่แปล — มังงะ/ญี่ปุ่น/จีน/เกาหลี ไม่ผ่านบริการแปลคำต่อคำ ใช้ Gemini ทั้งหน้า",
+        notes: "ยังไม่แปล — ญี่ปุ่น จีน และเกาหลีไม่ผ่านบริการแปลคำต่อคำ ใช้ Gemini ทั้งหน้า",
       });
     }
 
-    try {
-      const translations = await runTextTranslate({ texts, sourceLanguage });
-      return NextResponse.json({ translations, provider: "gemini-lite" });
-    } catch (error) {
-      console.error("translate-text gemini-lite failed", error);
-      const blob = texts.join("\n");
-      const translated = await translateEnglishBlob(blob);
-      const parts = String(translated || "").split("\n");
+    const blob = texts.join("\n");
+    const translated = await translateEnglishBlob(blob);
+    const unchanged =
+      !translated || translated.trim() === blob.trim() || /MYMEMORY WARNING/i.test(translated);
+    if (unchanged) {
       return NextResponse.json({
-        translations: texts.map((text, index) => (parts[index] || "").trim() || text),
-        provider: "mymemory-en",
+        translations: texts.map(() => ""),
+        provider: "none",
+        notes: "แปลป้ายภาษาอังกฤษไม่สำเร็จในโหมดไม่ใช้โควต้า",
       });
     }
+
+    const parts = String(translated).split("\n");
+    return NextResponse.json({
+      translations: texts.map((text, index) => {
+        const line = (parts[index] || "").trim();
+        if (!line || line === String(text).trim() || /MYMEMORY WARNING/i.test(line)) return "";
+        return line;
+      }),
+      provider: "mymemory-en",
+      notes: "",
+    });
   } catch (error) {
     console.error("translate-text failed", error);
     return NextResponse.json(
-      { error: "แปลข้อความไม่สำเร็จ (โหมดประหยัด RPD)" },
+      { error: "แปลข้อความไม่สำเร็จ (โหมดไม่ใช้โควต้า)" },
       { status: 502 },
     );
   }
@@ -54,9 +61,7 @@ async function translateEnglishBlob(text) {
     headers: { Accept: "application/json" },
     signal: AbortSignal.timeout(12000),
   });
-  if (!response.ok) return text;
+  if (!response.ok) return "";
   const data = await response.json();
-  const translated = String(data?.responseData?.translatedText || "");
-  if (!translated || /MYMEMORY WARNING/i.test(translated)) return text;
-  return translated;
+  return String(data?.responseData?.translatedText || "");
 }

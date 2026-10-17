@@ -52,11 +52,18 @@ export async function POST(request) {
         ? "Auto-detect the source language. Prioritize Japanese, English, and Chinese (Simplified or Traditional)."
         : `The source language is ${source.englishName}.`;
     if (region) {
-      sourceHint +=
-        " This image is a crop of ONE text region. Return a single block covering the lettering (x/y near 0, width/height near 1). Translate the full utterance into one connected Thai phrase, not separate words.";
+      sourceHint += " One cropped region: a single tight block, one Thai phrase.";
     }
 
-    const output = await runVisionTranslate({ image, sourceHint, difficulty, pageKind });
+    const output = await runVisionTranslate({
+      image,
+      sourceHint,
+      difficulty,
+      pageKind,
+      sourceLanguage: source.code,
+      geminiKey: typeof body?.geminiKey === "string" ? body.geminiKey : "",
+      geminiSlot: body?.geminiSlot,
+    });
     return NextResponse.json(output);
   } catch (error) {
     console.error("translate failed", error);

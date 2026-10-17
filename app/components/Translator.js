@@ -9,6 +9,20 @@ import {
   upsertHistoryItem,
 } from "@/lib/history-storage";
 import {
+  clearDrivePages,
+  createDriveCategory,
+  deleteDriveCategory,
+  deleteDrivePage,
+  disconnectDrive,
+  fetchDrivePage,
+  fetchDriveStatus,
+  fetchLibrary,
+  moveDrivePage,
+  readSavedCategory,
+  rememberCategory,
+  saveDrivePage,
+} from "@/lib/library-client";
+import {
   fingerprintImage,
   geminiCacheKey,
   getGeminiCache,
@@ -21,9 +35,11 @@ import {
   recordGeminiUse,
 } from "@/lib/gemini-quota";
 import { cropAndBinarize, looksLikeManga } from "@/lib/ocr-preprocess";
+import { keyRequestFields, keyScope, keySettingsLabel } from "@/lib/gemini-key-settings";
 import { translateLinesToThai } from "@/lib/free-translate";
 import { renderThaiOverlay } from "@/lib/overlay-text";
-import { prepareImageFile, prepareImageFromDataUrl } from "@/lib/prepare-image";
+import { prepareImageFile, prepareImageFromDataUrl, shrinkForVision } from "@/lib/prepare-image";
+import KeySettings from "./KeySettings";
 import {
   recognizeWithTesseract,
   tesseractNeedsLanguageDownload,
@@ -31,7 +47,7 @@ import {
 
 const ENGINE_KEY = "phap-plae-engine-v2";
 const SOURCE_ENGINE_KEY = "phap-plae-engine-by-source";
-const ENGINES = ["auto", "tesseract", "gemini"];
+const ENGINES = ["auto", "tesseract", "lite", "gemini"];
 const UNTRANSLATED_NOTE =
   "โควต้า Gemini เต็มแล้ว — แสดงต้นฉบับ OCR ยังไม่แปล (ไม่ส่งมังงะเข้าบริการแปลคำต่อคำ)";
 
@@ -59,10 +75,27 @@ export default function Translator() {
   const [lightboxItem, setLightboxItem] = useState(null);
   const [zoom, setZoom] = useState(1);
   const [progress, setProgress] = useState({ percent: 0, label: "" });
+  const [usedRemark, setUsedRemark] = useState("");
   const [history, setHistory] = useState([]);
+  const [driveOn, setDriveOn] = useState(false);
+  const [driveConfigured, setDriveConfigured] = useState(false);
+  const [categories, setCategories] = useState([]);
+  const [categoryFilter, setCategoryFilter] = useState("all");
+  const [saveCategoryId, setSaveCategoryId] = useState("none");
+  const [categoryName, setCategoryName] = useState("");
+  const [libraryBusy, setLibraryBusy] = useState("");
+  const [localCount, setLocalCount] = useState(0);
+  const [driveFolder, setDriveFolder] = useState("traslateManga/image");
+  const [keySettings, setKeySettings] = useState(() => ({
+    slot: "primary",
+    useCustom: false,
+    customKey: "",
+  }));
   const overlayToken = useRef(0);
   const paintTimer = useRef(null);
   const historyMetaRef = useRef({ id: null, createdAt: null });
+  const driveOnRef = useRef(false);
+  const saveCategoryRef = useRef("none");
 
   const applyPrepared = useCallback((prepared) => {
     setPreview(prepared.dataUrl);
@@ -70,6 +103,7 @@ export default function Translator() {
     setOverlay(null);
     setResult(null);
     setError("");
+    setUsedRemark("");
     setView("original");
     const saved = readSourceEngines()[fingerprintImage(prepared.dataUrl)];
     if (ENGINES.includes(saved)) setEngine(saved);
@@ -123,20 +157,38 @@ export default function Translator() {
   );
 
   useEffect(() => {
-    const items = loadHistory();
+    driveOnRef.current = driveOn;
+  }, [driveOn]);
+
+  useEffect(() => {
+    saveCategoryRef.current = saveCategoryId;
+  }, [saveCategoryId]);
+
+  useEffect(() => {
     const savedEngine = window.localStorage.getItem(ENGINE_KEY);
-    const quotaNow = readGeminiQuota();
+    const savedCategory = readSavedCategory();
+    const params = new URLSearchParams(window.location.search);
+    const driveFlag = params.get("drive");
+    const driveMessage = params.get("message") || "";
+    if (driveFlag) window.history.replaceState({}, "", window.location.pathname);
     const frame = window.requestAnimationFrame(() => {
-      setHistory(items);
-      setQuota(quotaNow);
       if (ENGINES.includes(savedEngine)) setEngine(savedEngine);
+      setSaveCategoryId(savedCategory);
+      if (driveFlag === "error" && driveMessage) setError(driveMessage);
     });
+    refreshLibrary(driveFlag === "connected");
     return () => window.cancelAnimationFrame(frame);
+    // โหลดคลังครั้งเดียวตอนเปิดหน้า
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
+    setQuota(readGeminiQuota(keyScope(keySettings)));
+  }, [keySettings]);
+
+  useEffect(() => {
     if (busy !== "translate" && busy !== "fetch") return undefined;
-    if (busy === "translate" && engine !== "gemini") return undefined;
+    if (busy === "translate" && engine !== "gemini" && engine !== "lite") return undefined;
     const timer = window.setInterval(() => {
       setProgress((current) => {
         const cap = busy === "fetch" ? 68 : 74;
@@ -221,62 +273,62 @@ export default function Translator() {
     setError("");
     setResult(null);
     setOverlay(null);
+    let noted = false;
     try {
-      const mangaLook = await looksLikeManga(image);
-      const cjk = isCjkSource(sourceLanguage);
-      const mangaPage = mangaLook || cjk;
+      const scope = keyScope(keySettings);
+      const keyLabel = keySettingsLabel(keySettings);
+      const geminiOnly = engine === "gemini" || engine === "lite";
+      const mangaPage = engine === "tesseract" ? false : await looksLikeManga(image);
       let data;
 
-      if (engine === "gemini" || mangaPage) {
-        const gate = canUseGemini();
+      if (engine === "tesseract") {
+        data = await runTesseractJob(image);
+      } else if (geminiOnly || mangaPage || isCjkSource(sourceLanguage)) {
+        const gate = canUseGemini(scope);
         if (gate.ok) {
-          setProgress({
-            percent: 20,
-            label: mangaPage ? "มังงะ/CJK — ส่ง Gemini ทั้งหน้า 1 ครั้ง" : "ส่ง Gemini ทั้งหน้า",
-          });
-          data = await runGeminiJob(image, {
-            difficulty: "hard",
+          data = await translateWithGemini(image, {
             pageKind: mangaPage ? "manga" : "",
+            upgrade: engine !== "lite",
           });
-        } else if (engine === "gemini" && !mangaPage) {
-          throw new Error(
-            gate.reason === "rpm"
-              ? "Gemini เกิน 5 ครั้งต่อนาที รอสักครู่"
-              : "Gemini วันนี้ครบ 20 ครั้งแล้ว",
-          );
+        } else if (geminiOnly) {
+          setUsedRemark(`ครั้งนี้ไม่เรียก Gemini · ${keyLabel} · ${quotaError(gate)}`);
+          noted = true;
+          throw new Error(quotaError(gate));
         } else {
           setProgress({ percent: 24, label: "โควต้า Gemini หมด — อ่านต้นฉบับ OCR" });
           data = await runTesseractJob(image, { translate: false, force: true });
-          data = untranslatedFromOcr(data, UNTRANSLATED_NOTE);
+          data = {
+            ...untranslatedFromOcr(data, UNTRANSLATED_NOTE),
+            usageQuotaFallback: true,
+            usageKeyLabel: keyLabel,
+          };
         }
       } else {
         data = await runTesseractJob(image);
+        const joined = data.originalText || "";
+        const cjkText = isCjkSource(data.detectedLanguageCode) || textLooksCjk(joined);
         const mustGemini =
-          data.kind === "manga" ||
-          data.needsGemini ||
-          isCjkSource(data.detectedLanguageCode) ||
-          textLooksCjk(data.originalText) ||
-          tesseractIsPoor(data);
+          data.kind === "manga" || data.needsGemini || tesseractIsPoor(data) || cjkText;
         if (mustGemini) {
-          const gate = canUseGemini();
+          const gate = canUseGemini(scope);
           if (gate.ok) {
-            setProgress({ percent: 76, label: "Tesseract อ่านไม่ชัด — ส่ง Gemini ทั้งหน้า 1 ครั้ง" });
-            data = await runGeminiJob(image, {
-              difficulty: "hard",
-              pageKind:
-                data.kind === "manga" || isCjkSource(data.detectedLanguageCode) ? "manga" : "",
+            data = await translateWithGemini(image, {
+              pageKind: data.kind === "manga" || data.needsGemini ? "manga" : "",
             });
-          } else if (
-            data.kind === "manga" ||
-            data.needsGemini ||
-            isCjkSource(data.detectedLanguageCode)
-          ) {
-            data = untranslatedFromOcr(data, UNTRANSLATED_NOTE);
+          } else if (data.kind === "manga" || data.needsGemini || cjkText) {
+            data = {
+              ...untranslatedFromOcr(data, UNTRANSLATED_NOTE),
+              usageQuotaFallback: true,
+              usageKeyLabel: keyLabel,
+            };
           }
         }
       }
+      setUsedRemark(describeUsage(data));
+      noted = true;
       await completeTranslation(image, data);
     } catch (err) {
+      if (!noted) setUsedRemark("ครั้งนี้แปลไม่สำเร็จ");
       setError(err.message || "แปลไม่สำเร็จ");
       setProgress({ percent: 0, label: "" });
     } finally {
@@ -292,7 +344,7 @@ export default function Translator() {
     setProgress({ percent: 92, label: "บันทึกประวัติ" });
     const id = crypto.randomUUID();
     historyMetaRef.current = { id, createdAt: null };
-    const items = await upsertHistoryItem({
+    const items = await persistHistory({
       id,
       fileName: fileName || imageUrl.split("/").pop() || "image.jpg",
       sourceLanguage,
@@ -317,7 +369,7 @@ export default function Translator() {
     setProgress({ percent: 12, label: "ส่งทั้งหน้าให้ Gemini" });
     setError("");
     try {
-      const data = await runGeminiJob(preview, { difficulty: "hard", pageKind: "manga" });
+      const data = await translateWithGemini(preview, { pageKind: "manga" });
       await completeTranslation(preview, data);
     } catch (err) {
       setError(err.message || "ส่ง Gemini ทั้งหน้าไม่สำเร็จ");
@@ -327,33 +379,50 @@ export default function Translator() {
     }
   }
 
-  async function runGeminiJob(image, { region = false, difficulty = "hard", pageKind = "" } = {}) {
-    const gate = canUseGemini();
-    if (!gate.ok) {
-      throw new Error(
-        gate.reason === "rpm"
-          ? "Gemini เกิน 5 ครั้งต่อนาที รอสักครู่"
-          : "Gemini วันนี้ครบ 20 ครั้งแล้ว",
-      );
+  async function translateWithGemini(image, { pageKind = "", upgrade = true } = {}) {
+    const keyLabel = keySettingsLabel(keySettings);
+    setProgress({ percent: 20, label: pageKind === "manga" ? "มังงะ — Flash-Lite ทั้งหน้า" : "Flash-Lite ทั้งหน้า" });
+    let data = await runGeminiJob(image, { difficulty: "easy", pageKind });
+    const usagePasses = [usagePass(data)];
+    if (upgrade && geminiIsPoor(data) && canUseGemini(keyScope(keySettings)).ok) {
+      setProgress({ percent: 58, label: "Flash-Lite อ่านไม่ครบ — ส่ง 3.6 Flash" });
+      data = await runGeminiJob(image, { difficulty: "hard", pageKind });
+      usagePasses.push(usagePass(data));
     }
+    return { ...data, usagePasses, usageKeyLabel: keyLabel };
+  }
+
+  async function runGeminiJob(image, { region = false, difficulty = "hard", pageKind = "" } = {}) {
+    const scope = keyScope(keySettings);
+    const gate = canUseGemini(scope);
+    if (!gate.ok) throw new Error(quotaError(gate));
     const kind = pageKind || ((await looksLikeManga(image)) ? "manga" : "");
-    const cacheKey = geminiCacheKey({ image, sourceLanguage, difficulty, region, pageKind: kind });
+    const cacheKey = geminiCacheKey({
+      image,
+      sourceLanguage,
+      difficulty,
+      region,
+      pageKind: kind,
+      keyScope: keyScope(keySettings),
+    });
     const cached = getGeminiCache(cacheKey);
     if (cached) return { ...cached, fromCache: true };
+    const visionImage = region ? image : await shrinkForVision(image);
     const response = await fetch("/api/translate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        image,
+        image: visionImage,
         sourceLanguage,
         region,
         difficulty,
         pageKind: kind,
+        ...keyRequestFields(keySettings),
       }),
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || "แปลไม่สำเร็จ");
-    setQuota(recordGeminiUse());
+    setQuota(recordGeminiUse(scope));
     setGeminiCache(cacheKey, data);
     return data;
   }
@@ -378,13 +447,7 @@ export default function Translator() {
       },
       { force },
     );
-    const skipTranslate =
-      !translate ||
-      ocr.kind === "manga" ||
-      ocr.needsGemini ||
-      isCjkSource(sourceLanguage) ||
-      isCjkSource(ocr.detectedLanguageCode) ||
-      textLooksCjk(ocr.originalText);
+    const skipTranslate = !translate || ocr.kind === "manga" || ocr.needsGemini;
     if (skipTranslate) {
       const blocks = ocr.blocks.map((block) => ({ ...block, translation: "" }));
       return {
@@ -398,6 +461,7 @@ export default function Translator() {
         blocks,
         provider: "tesseract",
         providerLabel: "Tesseract ในเบราว์เซอร์ — ไม่กินโควต้า",
+        textProvider: "none",
         targetLanguage: "th",
         targetLanguageName: "ไทย",
         needsGemini: Boolean(ocr.needsGemini || ocr.kind === "manga"),
@@ -411,17 +475,18 @@ export default function Translator() {
         clearTexts.push(block.original);
       }
     });
-    setProgress({ percent: 74, label: "แปลป้ายพิมพ์ทั้งก้อน — ไม่กินโควต้า 3.6 Flash" });
-    const translations = clearTexts.length
+    setProgress({ percent: 74, label: "แปลป้ายโดยไม่ใช้โควต้า Gemini" });
+    const translated = clearTexts.length
       ? await translateLinesToThai(clearTexts, sourceLanguage)
-      : [];
+      : { translations: [], notes: "" };
     const blocks = ocr.blocks.map((block, index) => {
       const slot = clearIndexes.indexOf(index);
       if (slot === -1) return { ...block, translation: "" };
+      const line = String(translated.translations[slot] || "").trim();
+      const same = line === String(block.original || "").trim();
       return {
         ...block,
-        translation: translations[slot] || block.original,
-        unclear: false,
+        translation: line && !same ? line : "",
       };
     });
     return {
@@ -434,10 +499,11 @@ export default function Translator() {
         .filter((block) => block.translation)
         .map((block) => block.translation)
         .join("\n\n"),
-      notes: ocr.notes,
+      notes: [ocr.notes, translated.notes].filter(Boolean).join(" "),
       blocks,
       provider: "tesseract",
       providerLabel: "Tesseract ในเบราว์เซอร์ — ไม่กินโควต้า",
+      textProvider: translated.provider || "none",
       targetLanguage: "th",
       targetLanguageName: "ไทย",
       needsGemini: Boolean(ocr.needsGemini),
@@ -475,7 +541,7 @@ export default function Translator() {
       setView("overlay");
       const overlayUrl = await paintOverlay(preview, paintableBlocks(blocks));
       if (historyMetaRef.current.id) {
-        const items = await upsertHistoryItem({
+        const items = await persistHistory({
           id: historyMetaRef.current.id,
           createdAt: historyMetaRef.current.createdAt,
           fileName: fileName || "image.jpg",
@@ -511,6 +577,7 @@ export default function Translator() {
     setFileName("");
     setResult(null);
     setError("");
+    setUsedRemark("");
     setView("original");
     setProgress({ percent: 0, label: "" });
     historyMetaRef.current = { id: null, createdAt: null };
@@ -518,32 +585,177 @@ export default function Translator() {
     if (cameraRef.current) cameraRef.current.value = "";
   }
 
-  function restoreHistory(item) {
-    historyMetaRef.current = { id: item.id, createdAt: item.createdAt };
-    setPreview(item.original || item.originalThumb || null);
-    setOverlay(item.overlay || item.overlayThumb || null);
-    setFileName(item.fileName || "history.jpg");
-    setResult(item.result || null);
-    setSourceLanguage(item.sourceLanguage || "auto");
-    if (ENGINES.includes(item.engine)) setEngine(item.engine);
-    setView(item.overlay || item.overlayThumb ? "overlay" : "original");
+  async function restoreHistory(item) {
     setError("");
     setLightboxOpen(false);
     setLightboxItem(null);
-    setProgress({ percent: 0, label: "" });
-  }
-
-  function removeHistory(id) {
-    const items = deleteHistoryItem(id);
-    setHistory(items);
-    if (historyMetaRef.current.id === id) {
-      historyMetaRef.current = { id: null, createdAt: null };
+    try {
+      const full = await hydrateHistoryItem(item);
+      const original = await ensureDataUrl(full.original || full.originalThumb);
+      const overlayUrl = await ensureDataUrl(full.overlay || full.overlayThumb);
+      historyMetaRef.current = { id: full.id, createdAt: full.createdAt };
+      setPreview(original);
+      setOverlay(overlayUrl);
+      setFileName(full.fileName || "history.jpg");
+      setResult(full.result || null);
+      setSourceLanguage(full.sourceLanguage || "auto");
+      if (ENGINES.includes(full.engine)) setEngine(full.engine);
+      setView(overlayUrl ? "overlay" : "original");
+      setProgress({ percent: 0, label: "" });
+    } catch (err) {
+      setError(err.message || "เปิดไฟล์จาก Drive ไม่สำเร็จ");
     }
   }
 
-  function removeAllHistory() {
-    setHistory(clearHistory());
-    historyMetaRef.current = { id: null, createdAt: null };
+  async function removeHistory(id) {
+    try {
+      const items = driveOnRef.current ? (await deleteDrivePage(id)).pages : deleteHistoryItem(id);
+      setHistory(items);
+      if (historyMetaRef.current.id === id) {
+        historyMetaRef.current = { id: null, createdAt: null };
+      }
+    } catch (err) {
+      setError(err.message || "ลบไฟล์ไม่สำเร็จ");
+    }
+  }
+
+  async function removeAllHistory() {
+    if (driveOnRef.current) {
+      const accepted = window.confirm(`ลบทุกหน้าในโฟลเดอร์ ${driveFolder} บน Google Drive?`);
+      if (!accepted) return;
+    }
+    try {
+      const items = driveOnRef.current ? (await clearDrivePages()).pages : clearHistory();
+      setHistory(items);
+      historyMetaRef.current = { id: null, createdAt: null };
+    } catch (err) {
+      setError(err.message || "ล้างประวัติไม่สำเร็จ");
+    }
+  }
+
+  async function refreshLibrary() {
+    try {
+      const status = await fetchDriveStatus();
+      setDriveConfigured(status.configured);
+      setDriveOn(status.connected);
+      driveOnRef.current = status.connected;
+      if (!status.connected) {
+        setHistory(loadHistory());
+        setCategories([]);
+        setLocalCount(0);
+        if (status.expired) setError("การเชื่อม Drive หมดอายุ กดเชื่อมใหม่");
+        return;
+      }
+      const data = await fetchLibrary();
+      setCategories(data.categories || []);
+      setHistory(data.pages || []);
+      if (data.folder) setDriveFolder(data.folder);
+      setLocalCount(loadHistory().length);
+    } catch (err) {
+      setDriveOn(false);
+      driveOnRef.current = false;
+      setHistory(loadHistory());
+      setError(err.message || "โหลดคลัง Drive ไม่สำเร็จ");
+    }
+  }
+
+  async function persistHistory(item) {
+    const payload = {
+      ...item,
+      categoryId: item.categoryId || saveCategoryRef.current || "none",
+    };
+    if (!driveOnRef.current) return upsertHistoryItem(payload);
+    const data = await saveDrivePage(payload);
+    setCategories(data.categories || []);
+    return data.pages || [];
+  }
+
+  async function hydrateHistoryItem(item) {
+    if (!driveOnRef.current || item.result?.blocks) return item;
+    return fetchDrivePage(item.id);
+  }
+
+  function chooseSaveCategory(categoryId) {
+    setSaveCategoryId(categoryId);
+    saveCategoryRef.current = categoryId;
+    rememberCategory(categoryId);
+  }
+
+  async function addCategory() {
+    const name = categoryName.trim();
+    if (!name) return;
+    setLibraryBusy("category");
+    setError("");
+    try {
+      const data = await createDriveCategory(name);
+      setCategories(data.categories || []);
+      chooseSaveCategory(data.category.id);
+      setCategoryName("");
+    } catch (err) {
+      setError(err.message || "สร้างหมวดไม่สำเร็จ");
+    } finally {
+      setLibraryBusy("");
+    }
+  }
+
+  async function removeCategory(categoryId) {
+    if (!window.confirm("ลบหมวดนี้? หน้าข้างในจะย้ายไปยังไม่จัด")) return;
+    setLibraryBusy("category");
+    try {
+      const data = await deleteDriveCategory(categoryId);
+      setCategories(data.categories || []);
+      setHistory(data.pages || []);
+      if (saveCategoryRef.current === categoryId) chooseSaveCategory("none");
+      if (categoryFilter === categoryId) setCategoryFilter("all");
+    } catch (err) {
+      setError(err.message || "ลบหมวดไม่สำเร็จ");
+    } finally {
+      setLibraryBusy("");
+    }
+  }
+
+  async function changePageCategory(pageId, categoryId) {
+    setLibraryBusy(pageId);
+    try {
+      const data = await moveDrivePage(pageId, categoryId);
+      setCategories(data.categories || []);
+      setHistory(data.pages || []);
+    } catch (err) {
+      setError(err.message || "ย้ายหมวดไม่สำเร็จ");
+    } finally {
+      setLibraryBusy("");
+    }
+  }
+
+  async function importLocalHistory() {
+    const localItems = loadHistory();
+    if (!localItems.length) return;
+    setLibraryBusy("import");
+    setError("");
+    try {
+      let latest = null;
+      for (const item of localItems) {
+        latest = await saveDrivePage({ ...item, categoryId: "none" });
+      }
+      if (latest) {
+        clearHistory();
+        setLocalCount(0);
+        setCategories(latest.categories || []);
+        setHistory(latest.pages || []);
+      }
+    } catch (err) {
+      setError(err.message || "นำเข้าประวัติจากเครื่องนี้ไม่สำเร็จ");
+    } finally {
+      setLibraryBusy("");
+    }
+  }
+
+  async function disconnectLibrary() {
+    await disconnectDrive();
+    setDriveOn(false);
+    driveOnRef.current = false;
+    setCategories([]);
+    setHistory(loadHistory());
   }
 
   function updateBlock(index, translation) {
@@ -559,19 +771,23 @@ export default function Translator() {
     setResult(next);
     window.clearTimeout(paintTimer.current);
     paintTimer.current = window.setTimeout(async () => {
-      const overlayUrl = await paintOverlay(preview, paintableBlocks(next.blocks));
-      if (!historyMetaRef.current.id) return;
-      const items = await upsertHistoryItem({
-        id: historyMetaRef.current.id,
-        createdAt: historyMetaRef.current.createdAt,
-        fileName: fileName || "image.jpg",
-        sourceLanguage,
-        engine,
-        result: next,
-        original: preview,
-        overlay: overlayUrl || overlay,
-      });
-      setHistory(items);
+      try {
+        const overlayUrl = await paintOverlay(preview, paintableBlocks(next.blocks));
+        if (!historyMetaRef.current.id) return;
+        const items = await persistHistory({
+          id: historyMetaRef.current.id,
+          createdAt: historyMetaRef.current.createdAt,
+          fileName: fileName || "image.jpg",
+          sourceLanguage,
+          engine,
+          result: next,
+          original: preview,
+          overlay: overlayUrl || overlay,
+        });
+        setHistory(items);
+      } catch (err) {
+        setError(err.message || "บันทึกคลังไม่สำเร็จ");
+      }
     }, 280);
   }
 
@@ -591,6 +807,10 @@ export default function Translator() {
   }
 
   const shownImage = view === "overlay" && overlay ? overlay : preview;
+  const visibleHistory =
+    !driveOn || categoryFilter === "all"
+      ? history
+      : history.filter((item) => (item.categoryId || "none") === categoryFilter);
   const translating = busy === "translate";
   const fetching = busy === "fetch";
   const lightboxOriginal = lightboxItem
@@ -615,12 +835,18 @@ export default function Translator() {
     setLightboxOpen(true);
   }
 
-  function openHistoryLarge(item) {
-    const hasOverlay = Boolean(item.overlay || item.overlayThumb);
-    setLightboxItem(item);
-    setView(hasOverlay ? "overlay" : "original");
-    setZoom(1);
-    setLightboxOpen(true);
+  async function openHistoryLarge(item) {
+    setError("");
+    try {
+      const full = await hydrateHistoryItem(item);
+      const hasOverlay = Boolean(full.overlay || full.overlayThumb);
+      setLightboxItem(full);
+      setView(hasOverlay ? "overlay" : "original");
+      setZoom(1);
+      setLightboxOpen(true);
+    } catch (err) {
+      setError(err.message || "เปิดรูปไม่สำเร็จ");
+    }
   }
 
   return (
@@ -638,7 +864,8 @@ export default function Translator() {
             อัปโหลดรูป หรือวาง URL รูปภาพได้
           </p>
         </div>
-        <div className="flex items-center gap-3 text-xs text-foreground/50">
+        <div className="flex flex-wrap items-center gap-3 text-xs text-foreground/50">
+          <KeySettings onChange={setKeySettings} />
           <span className="h-px w-8 bg-line" />
           {result?.providerLabel || engineLabel(engine)}
         </div>
@@ -665,13 +892,14 @@ export default function Translator() {
         <div>
           <p className="text-sm text-paper">โหมด OCR</p>
           <p className="mt-1 text-xs leading-5 text-foreground/50">
-            Auto: มังงะ/ญี่ปุ่น/จีน/เกาหลี → Gemini ทั้งหน้า · ป้ายพิมพ์ชัด → Tesseract ไม่กินโควต้า
+            Auto: มังงะ → Flash-Lite ทั้งหน้า · ป้ายพิมพ์ชัด → Tesseract · Gemini Flash Lite ใช้ทั้งหน้าอย่างเดียว ไม่ต่อ 3.6 Flash
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
           {[
             { id: "auto", label: "Auto" },
             { id: "tesseract", label: "Tesseract" },
+            { id: "lite", label: "Gemini Flash Lite" },
             { id: "gemini", label: "Gemini" },
           ].map((item) => (
             <button
@@ -854,10 +1082,13 @@ export default function Translator() {
                 ถ่ายรูป
               </label>
             </div>
-            <p className="mt-3 text-xs text-foreground/50">
+            <p className="mt-3 text-xs leading-5 text-gold">
+              {usedRemark || "กดแปลแล้วจะบอกตรงนี้ว่าครั้งนั้นใช้ตัวไหน"}
+            </p>
+            <p className="mt-1 text-xs text-foreground/50">
               {engine === "tesseract"
                 ? "โหมด Tesseract — ไม่กินโควต้า Gemini"
-                : `โหมด ${engine === "auto" ? "Auto" : "Gemini"} · เหลือ ${quota.remaining} จาก ${GEMINI_RPD} ครั้งวันนี้`}
+                : `โหมด ${engineModeLabel(engine)} · ${keySettingsLabel(keySettings)} · เหลือ ${quota.remaining} จาก ${GEMINI_RPD} ครั้งวันนี้`}
             </p>
             {busy || progress.percent > 0 ? (
               <div className="mt-4">
@@ -893,8 +1124,8 @@ export default function Translator() {
                   พรีวิวรูปทับไทยจะโผล่ทางซ้าย
                 </p>
                 <ul className="space-y-1 text-sm text-ink/55">
-                  <li>1. มังงะและภาษา ja/ko/zh ใช้ Gemini ทั้งหน้าโดยอัตโนมัติ</li>
-                  <li>2. ป้ายพิมพ์ชัดใช้ Tesseract — ไม่กินโควต้า</li>
+                  <li>1. มังงะใช้ Flash-Lite ทั้งหน้า ค่อยใช้ 3.6 Flash ถ้าอ่านไม่ครบ</li>
+                  <li>2. ป้ายพิมพ์ชัดใช้ Tesseract แล้วแปลข้อความ — ไม่ส่งทั้งรูป</li>
                   <li>3. แก้รายช่องใช้ Flash-Lite ถ้ายังมีโควต้า</li>
                 </ul>
               </div>
@@ -957,7 +1188,7 @@ export default function Translator() {
                               <button
                                 type="button"
                                 onClick={() => geminiForBlock(index)}
-                                disabled={Boolean(busy) || !canUseGemini().ok}
+                                disabled={Boolean(busy) || !canUseGemini(keyScope(keySettings)).ok}
                                 className="mt-2 text-xs text-gold hover:underline disabled:opacity-40 cursor-pointer"
                               >
                                 {busyBlock === index
@@ -1003,28 +1234,118 @@ export default function Translator() {
       </section>
 
       <section className="rounded-[28px] border border-line bg-panel p-5">
-        <div className="mb-4 flex items-end justify-between gap-3">
+        <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
           <div>
-            <h2 className="text-xl uppercase tracking-[0.2em] text-foreground/80 font-bold">ประวัติในเครื่องนี้</h2>
+            <h2 className="text-xl uppercase tracking-[0.2em] text-foreground/80 font-bold">
+              {driveOn ? "คลังใน Google Drive" : "ประวัติในเครื่องนี้"}
+            </h2>
             <p className="mt-1 text-sm text-foreground/55">
-              ไฟล์ที่แปลแล้วเก็บใน localStorage ของเบราว์เซอร์นี้
+              {driveOn
+                ? `หน้าแปลอยู่ในโฟลเดอร์ ${driveFolder} บน Drive ของบัญชีที่เชื่อมไว้`
+                : "ไฟล์ที่แปลแล้วเก็บใน localStorage ของเบราว์เซอร์นี้"}
             </p>
           </div>
-          {history.length ? (
-            <button
-              type="button"
-              onClick={removeAllHistory}
-              className="text-xs text-foreground/45 hover:text-paper cursor-pointer"
-            >
-              ล้างทั้งหมด
-            </button>
-          ) : null}
+          <div className="flex flex-wrap items-center gap-3">
+            {driveOn ? (
+              <button
+                type="button"
+                onClick={disconnectLibrary}
+                className="text-xs text-foreground/45 hover:text-paper cursor-pointer"
+              >
+                เลิกเชื่อม Drive
+              </button>
+            ) : driveConfigured ? (
+              <a href="/api/drive/connect" className="rounded-full bg-gold px-4 py-2 text-sm font-semibold text-ink">
+                เชื่อม Google Drive
+              </a>
+            ) : null}
+            {history.length ? (
+              <button
+                type="button"
+                onClick={removeAllHistory}
+                className="text-xs text-foreground/45 hover:text-paper cursor-pointer"
+              >
+                ล้างทั้งหมด
+              </button>
+            ) : null}
+          </div>
         </div>
-        {history.length === 0 ? (
+        {driveOn ? (
+          <div className="mb-4 flex flex-col gap-3">
+            <div className="flex flex-wrap gap-2">
+              <CategoryChip active={categoryFilter === "all"} onClick={() => setCategoryFilter("all")}>
+                ทั้งหมด
+              </CategoryChip>
+              {categories.map((category) => (
+                <CategoryChip
+                  key={category.id}
+                  active={categoryFilter === category.id}
+                  onClick={() => {
+                    setCategoryFilter(category.id);
+                    chooseSaveCategory(category.id);
+                  }}
+                >
+                  {category.name}
+                </CategoryChip>
+              ))}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <label className="text-xs text-foreground/55" htmlFor="save-category">
+                หน้าใหม่ลงหมวด
+              </label>
+              <select
+                id="save-category"
+                value={saveCategoryId}
+                onChange={(event) => chooseSaveCategory(event.target.value)}
+                className="rounded-full border border-line bg-background px-3 py-1 text-sm text-paper"
+              >
+                {categories.map((category) => (
+                  <option key={category.id} value={category.id}>
+                    {category.name}
+                  </option>
+                ))}
+              </select>
+              <input
+                value={categoryName}
+                onChange={(event) => setCategoryName(event.target.value)}
+                placeholder="ชื่อหมวดใหม่"
+                className="rounded-full border border-line bg-background px-3 py-1 text-sm text-paper outline-none"
+              />
+              <button
+                type="button"
+                onClick={addCategory}
+                disabled={libraryBusy === "category" || !categoryName.trim()}
+                className="rounded-full border border-line px-3 py-1 text-sm text-paper disabled:opacity-40 cursor-pointer"
+              >
+                เพิ่มหมวด
+              </button>
+              {saveCategoryId !== "none" ? (
+                <button
+                  type="button"
+                  onClick={() => removeCategory(saveCategoryId)}
+                  className="text-xs text-foreground/45 hover:text-paper cursor-pointer"
+                >
+                  ลบหมวดนี้
+                </button>
+              ) : null}
+              {localCount ? (
+                <button
+                  type="button"
+                  onClick={importLocalHistory}
+                  disabled={libraryBusy === "import"}
+                  className="text-xs text-gold hover:underline disabled:opacity-40 cursor-pointer"
+                >
+                  {libraryBusy === "import" ? "กำลังนำเข้า…" : "นำเข้าประวัติจากเครื่องนี้"}
+                </button>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
+        {visibleHistory.length === 0 ? (
           <p className="text-sm text-foreground/40">ยังไม่มีไฟล์เก่า — แปลรูปแล้วจะโผล่ที่นี่</p>
         ) : (
           <ul className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-            {history.map((item) => (
+            {visibleHistory.map((item) => (
               <li key={item.id} className="overflow-hidden rounded-2xl border border-line bg-background">
                 <button
                   type="button"
@@ -1043,26 +1364,40 @@ export default function Translator() {
                   </span>
                   <span className="block px-3 pb-3 text-[11px] text-foreground/45">
                     {formatWhen(item.createdAt)}
-                    {item.result?.blocks?.length
-                      ? ` · ${item.result.blocks.length} บล็อก`
-                      : ""}
+                    {historyBlockCount(item) ? ` · ${historyBlockCount(item)} บล็อก` : ""}
                   </span>
                 </button>
-                <div className="flex items-center justify-between gap-2 border-t border-line px-3 py-2">
-                  <button
-                    type="button"
-                    onClick={() => restoreHistory(item)}
-                    className="text-xs text-gold hover:underline cursor-pointer"
-                  >
-                    เปิดในตัวแปล
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => removeHistory(item.id)}
-                    className="text-xs text-foreground/40 hover:text-paper cursor-pointer"
-                  >
-                    ลบ
-                  </button>
+                <div className="flex flex-col gap-2 border-t border-line px-3 py-2">
+                  {driveOn ? (
+                    <select
+                      value={item.categoryId || "none"}
+                      onChange={(event) => changePageCategory(item.id, event.target.value)}
+                      disabled={libraryBusy === item.id}
+                      className="w-full rounded-lg border border-line bg-panel px-2 py-1 text-xs text-paper"
+                    >
+                      {categories.map((category) => (
+                        <option key={category.id} value={category.id}>
+                          {category.name}
+                        </option>
+                      ))}
+                    </select>
+                  ) : null}
+                  <div className="flex items-center justify-between gap-2">
+                    <button
+                      type="button"
+                      onClick={() => restoreHistory(item)}
+                      className="text-xs text-gold hover:underline cursor-pointer"
+                    >
+                      เปิดในตัวแปล
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => removeHistory(item.id)}
+                      className="text-xs text-foreground/40 hover:text-paper cursor-pointer"
+                    >
+                      ลบ
+                    </button>
+                  </div>
                 </div>
               </li>
             ))}
@@ -1163,8 +1498,91 @@ export default function Translator() {
   );
 }
 
+function CategoryChip({ active, onClick, children }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`rounded-full px-3 py-1 text-sm cursor-pointer ${
+        active ? "bg-gold text-ink" : "border border-line text-paper"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function historyBlockCount(item) {
+  if (Number.isFinite(item?.blockCount)) return item.blockCount;
+  return item?.result?.blocks?.length || 0;
+}
+
+async function ensureDataUrl(src) {
+  if (!src) return null;
+  if (src.startsWith("data:")) return src;
+  const response = await fetch(src);
+  if (!response.ok) throw new Error("โหลดรูปจาก Drive ไม่สำเร็จ");
+  const blob = await response.blob();
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error("อ่านรูปไม่สำเร็จ"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function usagePass(data) {
+  return {
+    label: data?.providerLabel || "Gemini",
+    fromCache: Boolean(data?.fromCache),
+  };
+}
+
+function describeUsage(data) {
+  if (data?.usageQuotaFallback) {
+    const key = data.usageKeyLabel || "คีย์นี้";
+    return `ครั้งนี้โควต้า ${key} เต็ม จึงใช้ Tesseract อ่านต้นฉบับ ยังไม่แปล`;
+  }
+  if (data?.usagePasses?.length) {
+    const key = data.usageKeyLabel ? ` · ${data.usageKeyLabel}` : "";
+    const body = data.usagePasses
+      .map((pass) => `${pass.fromCache ? "ผลที่จำไว้ของ " : ""}${pass.label || "Gemini"}`)
+      .join(" แล้วต่อด้วย ");
+    return `ครั้งนี้ใช้ ${body}${key}`;
+  }
+  if (data?.provider === "tesseract") {
+    if (data.textProvider === "mymemory-en") {
+      return "ครั้งนี้ใช้ Tesseract อ่านป้าย แล้วแปลภาษาอังกฤษโดยไม่ใช้คีย์ Gemini";
+    }
+    if (data.needsGemini && !data.translation) {
+      return "ครั้งนี้ใช้ Tesseract ตรวจหน้า ยังไม่เรียก Gemini";
+    }
+    if (!data.translation) {
+      return "ครั้งนี้ใช้ Tesseract อ่านต้นฉบับ ยังไม่แปล และไม่ได้ใช้คีย์ Gemini";
+    }
+    return "ครั้งนี้ใช้ Tesseract ในเบราว์เซอร์ ไม่ได้ใช้คีย์ Gemini";
+  }
+  if (data?.providerLabel) return `ครั้งนี้ใช้ ${data.providerLabel}`;
+  return "ครั้งนี้แปลแล้ว";
+}
+
+function quotaError(gate) {
+  return gate?.reason === "rpm"
+    ? "Gemini เกิน 5 ครั้งต่อนาที รอสักครู่"
+    : "Gemini วันนี้ครบ 20 ครั้งแล้วสำหรับคีย์นี้";
+}
+
 function paintableBlocks(blocks) {
   return (blocks || []).filter((block) => block.translation && !block.unclear);
+}
+
+function geminiIsPoor(data) {
+  const blocks = data?.blocks || [];
+  if (!data?.hasText || !blocks.length) return true;
+  const short = blocks.filter(
+    (block) => String(block.original || "").replace(/\s+/g, "").length < 3,
+  ).length;
+  return short >= Math.max(2, Math.ceil(blocks.length * 0.45));
 }
 
 function tesseractIsPoor(data) {
@@ -1212,8 +1630,15 @@ function readSourceEngines() {
   }
 }
 
+function engineModeLabel(value) {
+  if (value === "lite") return "Gemini Flash Lite";
+  if (value === "gemini") return "Gemini";
+  return "Auto";
+}
+
 function engineLabel(value) {
-  if (value === "auto") return "Auto · มังงะไป Gemini ก่อน";
+  if (value === "auto") return "Auto · มังงะไป Flash-Lite ก่อน";
+  if (value === "lite") return "Gemini Flash Lite (กินโควต้า)";
   if (value === "gemini") return "Gemini (กินโควต้า)";
   return "Tesseract ในเบราว์เซอร์ — ไม่กินโควต้า";
 }
